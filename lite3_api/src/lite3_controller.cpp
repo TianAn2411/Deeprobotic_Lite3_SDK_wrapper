@@ -72,6 +72,8 @@ struct Lite3Controller::Impl {
     VecXf stand_target_pos;
     float stand_duration = 2.0f;
     float stand_elapsed = 0.0f;
+    VecXf prev_q_cmd;
+    bool prev_q_cmd_initialized = false;
 
     Impl() : current_mode(ControlMode::IDLE) {
         memset(&current_state, 0, sizeof(RobotBasicState));
@@ -248,12 +250,75 @@ void Lite3Controller::standUp(float duration, bool blocking) {
         std::cout << "[Lite3Controller] Stand up complete" << std::endl;
     }
 }
+void Lite3Controller::standUpTwoStage(float pre_stand_duration, float stand_duration) {
+    if (!pimpl_->initialized) {
+        initialize();
+    }
 
+    std::cout << "[Lite3Controller] Starting two-stage stand up..." << std::endl;
+
+    // --- Định nghĩa các góc mục tiêu (đã chuyển sang radian) ---
+    // Góc PreStand: {0, -70, 150} độ
+    VecXf pre_stand_angles = (Eigen::VectorXf(12) << 0, -1.2217, 2.618, 0, -1.2217, 2.618, 0, -1.2217, 2.618, 0, -1.2217, 2.618).finished();
+    // Góc Stand: {0, -42, 78} độ
+    VecXf stand_angles = (Eigen::VectorXf(12) << 0, -0.733, 1.361, 0, -0.733, 1.361, 0, -0.733, 1.361, 0, -0.733, 1.361).finished();
+
+    float dt = 1.0f / pimpl_->config.control_frequency;
+    auto kp = pimpl_->config.default_kp;
+    auto kd = pimpl_->config.default_kd;
+
+    // --- Giai đoạn 1: PreStandUp ---
+    std::cout << "[Lite3Controller] Stage 1: Executing PreStandUp..." << std::endl;
+    VecXf start_pos = getJointPositions(); // Lấy vị trí ban đầu
+    auto stage1_start_time = steady_clock::now();
+
+    for (float t = 0; t < pre_stand_duration; t += dt) {
+        // Nội suy vị trí và vận tốc
+        VecXf target_pos = interpolatePose(start_pos, pre_stand_angles, t / pre_stand_duration);
+        
+        float t_clamped = std::max(0.0f, std::min(1.0f, t / pre_stand_duration));
+        float vel_scalar = (6.0f * t_clamped * (1.0f - t_clamped)) / pre_stand_duration;
+        VecXf target_vel = (pre_stand_angles - start_pos) * vel_scalar;
+
+        setJointCommand(target_pos, kp, kd, target_vel);
+
+        // Sleep để duy trì tần số điều khiển
+        auto next_time = stage1_start_time + milliseconds(static_cast<int>((t + dt) * 1000));
+        std::this_thread::sleep_until(next_time);
+    }
+    // Đảm bảo robot đến đúng vị trí cuối của giai đoạn 1
+    setJointCommand(pre_stand_angles, kp, kd);
+    std::this_thread::sleep_for(milliseconds(50)); // Chờ một chút để ổn định
+
+    // --- "Get Init Data" ---
+    std::cout << "[Lite3Controller] Stage 1 complete. Getting data for Stage 2." << std::endl;
+    start_pos = getJointPositions(); // Lấy lại vị trí khớp hiện tại cho giai đoạn 2
+
+    // --- Giai đoạn 2: StandUp ---
+    std::cout << "[Lite3Controller] Stage 2: Executing StandUp..." << std::endl;
+    auto stage2_start_time = steady_clock::now();
+
+    for (float t = 0; t < stand_duration; t += dt) {
+        VecXf target_pos = interpolatePose(start_pos, stand_angles, t / stand_duration);
+
+        float t_clamped = std::max(0.0f, std::min(1.0f, t / stand_duration));
+        float vel_scalar = (6.0f * t_clamped * (1.0f - t_clamped)) / stand_duration;
+        VecXf target_vel = (stand_angles - start_pos) * vel_scalar;
+
+        setJointCommand(target_pos, kp, kd, target_vel);
+
+        auto next_time = stage2_start_time + milliseconds(static_cast<int>((t + dt) * 1000));
+        std::this_thread::sleep_until(next_time);
+    }
+    // Giữ vị trí đứng cuối cùng
+    setJointCommand(stand_angles, kp, kd);
+    std::cout << "[Lite3Controller] Two-stage stand up complete." << std::endl;
+}
 void Lite3Controller::setVelocity(float vx, float vy, float vyaw) {
     // Clamp to [-1, 1]
-    vx = std::max(-1.0f, std::min(1.0f, vx));
-    vy = std::max(-1.0f, std::min(1.0f, vy));
-    vyaw = std::max(-1.0f, std::min(1.0f, vyaw));
+    vx = std::max(-2.0f, std::min(2.0f, vx));
+    vy = std::max(-2.0f, std::min(2.0f, vy));
+    vyaw = std::max(-2.0f, std::min(2.0f, vyaw));
 
     pimpl_->current_command.forward_vel_scale = vx;
     pimpl_->current_command.side_vel_scale = vy;
@@ -279,8 +344,14 @@ void Lite3Controller::stop() {
 
 void Lite3Controller::emergencyStop() {
     std::cout << "[Lite3Controller] EMERGENCY STOP!" << std::endl;
+    // Đặt cờ an toàn và dừng. Không gọi stop() trực tiếp từ đây
+    // để tránh deadlock khi hàm này được gọi từ chính luồng điều khiển.
+    // Luồng điều khiển sẽ kiểm tra cờ này và tự thoát ra.
     pimpl_->safety_triggered = true;
     stop();
+    pimpl_->running = false;
+    // pimpl_->safety_triggered = true;
+    // pimpl_->running = false;
 
     // Set all joints to damping mode
     MatXf cmd(12, 5);
@@ -340,6 +411,23 @@ double Lite3Controller::getTimestamp() const {
 
 // ========== Advanced Control ==========
 
+void Lite3Controller::syncCurrentJointState() {
+    // Lấy lại vị trí hiện tại từ cảm biến
+    VecXf current_pos = getJointPositions();
+    VecXf zero_vel = VecXf::Zero(current_pos.size());
+
+    auto kp = pimpl_->config.default_kp;
+    auto kd = pimpl_->config.default_kd;
+
+    // Gửi lại lệnh PD tại vị trí hiện tại (reset lỗi)
+    setJointCommand(current_pos, kp, kd, zero_vel);
+
+    // Cập nhật dữ liệu nội bộ nếu có
+    pimpl_->current_state.joint_pos = current_pos;
+    pimpl_->current_state.cmd_vel_normlized = Vec3f::Zero();
+
+    std::cout << "[Lite3Controller] Sync joint state completed. Robot ready for velocity control." << std::endl;
+}
 void Lite3Controller::setJointCommand(
     const VecXf& target_pos,
     const VecXf& kp,
@@ -641,6 +729,37 @@ void Lite3Controller::executeControl() {
                 pimpl_->control_counter % pimpl_->policy_decimation == 0) {
                 RobotAction action = pimpl_->onnx_policy->GetRobotAction(pimpl_->current_state);
                 MatXf cmd = action.ConvertToMat();
+                VecXf q_rl = cmd.col(1);  // joint target từ policy
+
+                // offset nhỏ cho hip/knee để chân duỗi ra, thân cao lên
+                // Giả sử thứ tự joint: [hip, thigh, knee] * 4 chân
+                VecXf upright_offset(12);
+                upright_offset <<
+                    0.0f, +0.2f, -0.25f,   // front-left
+                    0.0f, +0.2f, -0.25f,   // front-right
+                    0.0f, +0.2f, -0.25f,   // rear-left
+                    0.0f, +0.2f, -0.25f;   // rear-right
+
+                // scale nhỏ để dễ thử
+                float height_scale = 1.0f;  // bắt đầu với 0.5–1.0
+                VecXf q_offset = q_rl + height_scale * upright_offset;
+                if (!pimpl_->prev_q_cmd_initialized) {
+                    pimpl_->prev_q_cmd = q_offset;
+                    pimpl_->prev_q_cmd_initialized = true;
+                }
+
+                float alpha = 0.3f;  // 0.2–0.4: càng nhỏ càng mượt nhưng hơi chậm
+                VecXf q_smooth = (1.0f - alpha) * pimpl_->prev_q_cmd + alpha * q_offset;
+                pimpl_->prev_q_cmd = q_smooth;
+
+                cmd.col(1) = q_smooth;
+
+                // // 4) Scale lại Kp / Kd cho bớt cứng
+                // float kp_scale = 0.9f;   // giảm Kp ~30%
+                // float kd_scale = 1.2f;   // tăng damping
+
+                // cmd.col(0) *= kp_scale;
+                // cmd.col(2) *= kd_scale;
                 pimpl_->robot_interface->SetJointCommand(cmd);
             }
             break;
@@ -693,7 +812,7 @@ void Lite3Controller::logData() {
 VecXf Lite3Controller::interpolatePose(const VecXf& start, const VecXf& end, float t) {
     // Smooth interpolation using cubic easing
     t = std::max(0.0f, std::min(1.0f, t));
-    float smooth_t = t * t * (3.0f - 2.0f * t);  // Smoothstep
+    float smooth_t = t*t*t*(t*(t*6 - 15) + 10);  // Smoothstep
     return start + smooth_t * (end - start);
 }
 
