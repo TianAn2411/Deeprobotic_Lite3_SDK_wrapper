@@ -22,23 +22,23 @@ except ImportError:
     print("onnxruntime is not installed. Please install it with: pip install onnxruntime")
     exit(1)
 
-FREQ_HZ = 100.0                   # tần số điều khiển loop C++
+FREQ_HZ = 50.0                   # tần số điều khiển loop C++
 VX_SCALE = 0.7                    # hệ số tốc tiến/lùi (0..1)
-VY_SCALE = 0.6                    # hệ số strafe trái/phải (0..1)
+VY_SCALE = 0.2                    # hệ số strafe trái/phải (0..1)
 VYAW_SCALE = 0.7                  # hệ số quay (0..1)
-SMOOTHING = 0.15                  # 0..1, càng lớn chuyển mượt hơn
+SMOOTHING = 0.5                # 0..1, càng lớn chuyển mượt hơn
 
 # ====== Biến trạng thái điều khiển từ bàn phím ======
 _cmd_lock = threading.Lock()
-_target_vx = 0.0
-_target_vy = 0.0
-_target_wz = 0.0
+_target_vx = 0
+_target_vy = 0
+_target_wz = 0
 _cur_vx = 0.0
 _cur_vy = 0.0
 _cur_wz = 0.0
 _running = True
 
-def clamp(x, lo=-1.0, hi=1.0): return max(lo, min(hi, x))
+def clamp(x, lo=-2.0, hi=2.0): return max(lo, min(hi, x))
 
 def _apply_smoothing(cur, target, alpha):
     return cur + (target - cur) * alpha
@@ -75,15 +75,19 @@ def _on_press(key):
     except: k = str(key)
     if k == 'w': _set_targets(vx=+VX_SCALE)
     elif k == 's': _set_targets(vx=-VX_SCALE)
-    elif k == 'a': _set_targets(wz=+VYAW_SCALE)
-    elif k == 'd': _set_targets(wz=-VYAW_SCALE)
+    elif k == 'a': _set_targets(vy=+VY_SCALE)
+    elif k == 'd': _set_targets(vy=-VY_SCALE)
+    elif k == 'q': _set_targets(wz=+VYAW_SCALE)
+    elif k == 'e': _set_targets(wz=-VYAW_SCALE)
+
 
 def _on_release(key):
     global _running
     try: k = key.char.lower()
     except: k = str(key)
     if k in ('w', 's'): _reset_axis("vx")
-    elif k in ('a', 'd'): _reset_axis("wz")
+    elif k in ('a', 'd'): _reset_axis("vy")
+    elif k in ('q', 'e'):_reset_axis("wz")
     elif k in ('Key.esc',): _running = False
     # giữ lại các phím khác
 
@@ -114,17 +118,17 @@ def _stdin_raw_thread(robot):
                 print("Pressed S, setting vx to", -VX_SCALE)
                 _set_targets(vx=-VX_SCALE)  # Gửi lệnh giảm tiến
             elif c == 'a': 
-                print("Pressed A, setting wz to", +VYAW_SCALE)
-                _set_targets(wz=+VYAW_SCALE)  # Gửi lệnh quay trái
+                print("Pressed A, setting vy to", +VY_SCALE)
+                _set_targets(vy=+VY_SCALE)  # Gửi lệnh quay trái
             elif c == 'd': 
-                print("Pressed D, setting wz to", -VYAW_SCALE)
-                _set_targets(wz=-VYAW_SCALE)  # Gửi lệnh quay phải
+                print("Pressed D, setting vy to", -VY_SCALE)
+                _set_targets(vy=-VY_SCALE)  # Gửi lệnh quay phải
             elif c == 'q': 
-                print("Pressed Q, setting vy to", +VY_SCALE)
-                _set_targets(vy=+VY_SCALE)  # Strafe trái
+                print("Pressed Q, setting wz to", +VYAW_SCALE)
+                _set_targets(wz=+VYAW_SCALE)  # Strafe trái
             elif c == 'e': 
-                print("Pressed E, setting vy to", -VY_SCALE)
-                _set_targets(vy=-VY_SCALE)  # Strafe phải
+                print("Pressed E, setting wz to", -VYAW_SCALE)
+                _set_targets(wz=-VYAW_SCALE)  # Strafe phải
             elif c == 'x': 
                 print("Pressed X, stopping all motion")
                 _set_targets(vx=0.0, vy=0.0, wz=0.0)  # Dừng tất cả
@@ -150,7 +154,7 @@ def main():
 
     # Stand up
     print("Standing up...")
-    robot.stand_up(duration=5.0, blocking=True)
+    robot.stand_up_two_stage(3.0, 5.0)
     time.sleep(1.0)
 
     # --- 2. Thiết lập chính sách tùy chỉnh và chạy robot ---
